@@ -1,10 +1,25 @@
 # Decisions
 
-This file records how I designed the service and why. It grows with the code: each part is added together with the code it explains. Parts that are not built yet are listed at the end.
+This file records how I designed the service and why.
+
+Where to find what the assignment asks for:
+
+| Asked for | Where |
+|---|---|
+| System invariants | [System invariants](#system-invariants) |
+| Ambiguities and the meaning I chose | [Ambiguities I found and the meaning I chose](#ambiguities-i-found-and-the-meaning-i-chose) |
+| Material decisions and alternatives | The thirteen sections titled "Decision:" |
+| Transaction, concurrency and idempotency | [Checkout: transaction, concurrency and retries](#checkout-transaction-concurrency-and-retries) and the decision after it |
+| Money and rounding | [Money and rounding rules](#money-and-rounding-rules) |
+| Error model | [Error model](#error-model) |
+| Implemented and deferred | [What is implemented and what is deferred](#what-is-implemented-and-what-is-deferred), [Known weaknesses](#known-weaknesses) |
+| Multiple instances and scale | [Multiple instances and production scale](#multiple-instances-and-production-scale) |
+| Use of AI | [How I used AI](#how-i-used-ai) |
+| Time spent, and two more hours | [Time spent](#time-spent), [With two more hours](#with-two-more-hours) |
 
 ## System invariants
 
-The rules the service must never break, and where each one is enforced. The list grows as the parts are built.
+The rules the service must never break, and where each one is enforced.
 
 1. **Stock is never oversold and never goes below zero.**
    Checkout takes stock with one statement that checks and changes together: `UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1` (`takeStock` in `src/checkout.ts`). Backstop in the database: `CHECK (stock >= 0)` on `products`. With the first guard removed as a test, ten carts raced for three units and the database check still held: stock ended at zero with three orders, and the other seven requests failed with a 500 where the real code gives a clean 409.
@@ -36,6 +51,35 @@ The rules the service must never break, and where each one is enforced. The list
     A coupon's percent is between 1 and 100, checked at startup and by the database. The discount is rounded down, so it is never more than the subtotal. Backstops in the database: `CHECK (total_paise >= 0)` and a check that an order without a coupon has no discount.
 15. **The report only reads, and its figures agree with each other.**
     The report runs in a read-only transaction that sees one frozen picture of the database (`withReadOnlySnapshot` in `src/db/pool.ts`). The database refuses any write inside it. Net revenue is always gross minus discounts, and coupons generated is always available plus redeemed.
+
+## Ambiguities I found and the meaning I chose
+
+The assignment leaves these open. Each row says what I chose. The reasons are in the section named in the last column.
+
+| Open question | What I chose | More in |
+|---|---|---|
+| What happens when a price changes after an item was added? | The cart line records the price it showed. The cart view flags a change. Checkout refuses a changed price until the client accepts it. | "The cart records the price it showed", "Accepting a changed price at checkout" |
+| What happens when stock changes after an item was added? | Nothing is held for a cart. Stock is checked and taken at checkout. | "Stock changes before checkout" |
+| One line of a cart is short on stock. Is the rest sold? | No. The whole checkout fails and lists every short line. | "Stock is taken at checkout, all or nothing" |
+| What state is a cart in after a failed checkout? | Open and unchanged. The client fixes it and checks out again. | "Checkout: transaction, concurrency and retries" |
+| How does the service recognise a retried checkout? | By the cart. One cart, one order. | "The cart itself makes checkout safe to retry" |
+| Is a second checkout of the same cart with a different coupon a retry? | No. It is refused, and that second coupon is not touched. | Same section |
+| "Add an item" and "change its quantity": two operations or one? | One call that sets the quantity, so it is safe to repeat. | "One call sets the quantity of a cart line" |
+| What is a "successfully placed order" when there is no payment? | Every order that exists. A checkout creates a complete order or nothing. There are no pending or cancelled orders. | "No payment step" |
+| "Every nth order": counted for the whole store, or for each customer? | The whole store. | "Coupons: what the assignment leaves open, and what I chose" |
+| Is a coupon created when the milestone is reached, or when the administrator asks? | When the administrator asks. | Same section |
+| Several milestones are owed. How many coupons does one call give? | One, for the lowest milestone. | Same section |
+| Who may use a coupon? | Whoever holds the code, once. | Same section |
+| Does an order that used a coupon count toward the next milestone? | Yes. | Same section |
+| Do coupons expire? | No. | Same section |
+| A coupon code is unknown or already used. Does the order go through at full price? | No. The checkout fails. | Same section |
+| What does a change of `n` do to milestones? | Milestones are multiples of the current `n`, above the last one that has a coupon. | "Milestones, and what happens when n changes" |
+| What does a change of `x` do to coupons that exist? | Nothing. Each coupon carries its own percent. | "Coupons: what the assignment leaves open, and what I chose" |
+| When can `n` and `x` change? | Only at startup. | "Settings are read once at startup and checked" |
+| How is x% rounded? | Down to the paisa, once per order. | "Money and rounding rules" |
+| Which currency? | The assignment names none. I used Indian rupees, stored as whole paise. | "Money and rounding rules" |
+| In the report, what is an "available" coupon? | Generated and not yet used. Milestones that are reached but have no coupon yet are shown separately as `coupons_owed`. | "The report" |
+| Which operations are administrative? | Everything under `/admin`. There is no authentication, which the assignment allows. | "Known weaknesses" |
 
 ## Decision: PostgreSQL, not an in-memory store
 
@@ -152,7 +196,7 @@ The coupon is claimed at step 4, before the steps that are most likely to fail, 
 **How overlapping requests are kept correct.** I use PostgreSQL's default isolation level (read committed). The safety does not come from a stricter level. It comes from two things:
 
 - **Row locks.** Step 1 uses `SELECT ... FOR UPDATE` on the cart. A second request for the same cart waits there until the first one commits or rolls back, and then reads what the first one left behind.
-- **Check and change in one statement.** Step 4 does not read the stock and then decide. The `UPDATE` only matches a row that still has enough stock, and the database locks that row while it runs. A second checkout waits for the first, re-checks against the new stock, and matches nothing if the stock is gone.
+- **Check and change in one statement.** Steps 4 and 5 do not read first and then decide. Each is an `UPDATE` that only matches a row that still qualifies: a coupon that is unused, a product that still has enough stock. The database locks that row while the statement runs. A second checkout waits for the first, re-checks against what the first one left, and matches nothing if the coupon or the stock is gone.
 
 What happens in each overlap:
 
@@ -358,7 +402,7 @@ Every error response has one shape:
   - **409**: the request is valid, but the current state refuses it.
 - Anything unexpected returns **500** with `INTERNAL_ERROR`. The real error goes to the server log and is never sent to the client.
 
-Codes so far:
+All codes:
 
 | Status | Code | When |
 |---|---|---|
@@ -376,20 +420,123 @@ Codes so far:
 | 409 | `PRICE_CHANGED` | A price changed since the line was saved and was not accepted. `details.items` lists each product with both prices. |
 | 500 | `INTERNAL_ERROR` | Anything unexpected |
 
-Each later part adds its own.
-
 **Unknown fields are refused.** A request body with a field the service does not know gets a 400. It is not ignored. The reason is checkout: a misspelt field there would otherwise be dropped silently, and the customer would get an order they did not intend.
 
 **Alternatives considered:**
 - RFC 9457 `application/problem+json`. It is a standard, but it has more fields for the same information.
 - Adding 422 for business-rule failures. That gives a fourth bucket, and the line between 409 and 422 is hard to state clearly.
 
-## Still to come
+## What is implemented and what is deferred
 
-These sections are added as the parts are built:
+**Implemented**
 
-- Ambiguities I found and the meaning I chose
-- What is implemented and what is deferred
-- Multiple instances and production scale
-- How I used AI
-- Time spent, and what I would look at with two more hours
+- Everything in the assignment's minimum list: carts (create, view, set a quantity, remove a line), checkout with an optional coupon, reading an order, coupon generation by the administrator and the administrator's report. Nothing from that list is missing.
+- The schema as numbered migrations, and six seed products through a seed script. One product has only 3 in stock.
+- Four things beyond the minimum, because the rest could not be exercised properly without them:
+  - `GET /products`, so a client can see what can be added to a cart.
+  - `GET /admin/coupons`, so an administrator can find a code again after a lost response, and so the report can be checked against something.
+  - `PATCH /admin/products/{productId}`, so a price or stock change can be tried through the API and not only with SQL.
+  - The `milestones` block in the report.
+- API docs as Swagger UI at `/docs`, built from the comments above each route. A test fails if a route and its docs drift apart.
+- One command that runs the database and the service in Docker, and one that runs the tests in Docker.
+
+**Deferred on purpose**
+
+| Not built | Why not, and what it would take |
+|---|---|
+| A payment step | A real payment cannot sit inside a database transaction. It needs pending orders, holds on stock and coupon, a table of payment attempts and an expiry. See "No payment step". |
+| Holding stock when an item is added | Abandoned carts would hold stock, so it needs an expiry and a cleanup job. |
+| Customers and authentication | The assignment says they are not needed. With them, coupons could belong to a customer and be limited per customer, and `/admin` could be protected. |
+| Richer coupons: an expiry date, a fixed amount, a minimum order value, a cap on the discount, more than one use | Not asked for. Each is a column plus a condition in the statement that claims the coupon. More than one use changes that condition from "unused" to "used fewer than the limit", still in one statement. |
+| Changing `n` and `x` while the service runs | Needs a settings table with a history, and a rule for a change that races with a checkout. |
+| A general `Idempotency-Key` header | Only checkout needs protection against retries, and the cart already gives it. |
+| A record of failed checkouts | A failed checkout is a refused request and leaves nothing behind. Keeping a history means writing outside the transaction that is rolled back. It belongs with the payment step. |
+| Stock movements in place of a stock number | The admin update sets the stock to a number, and the last write wins. |
+| Paging for the coupon list, cleanup of abandoned carts, rate limiting, structured logs, metrics | Needed in production. Not what this assignment tests. |
+| Down migrations, or a migration tool | The runner only goes forward. |
+
+## Known weaknesses
+
+Things in what I built that I know are weak. Most are named where they arise. They are collected here.
+
+1. **The price flag accepts whatever the price is now.** If a price changes a second time between the `PRICE_CHANGED` response and the accepting call, the customer pays a price they did not see. The fix is for the client to send the subtotal it saw.
+2. **One person can collect every coupon.** There are no customers, so nothing limits who uses the coupons.
+3. **No authentication.** Anyone who can reach the service can call `/admin`. A cart is protected only by its id being hard to guess.
+4. **No timeouts on the database.** A checkout that waits for a row lock waits as long as the holder takes. Transactions here are a few statements, so the wait is short, but nothing enforces that.
+5. **The stock check when a line is saved is a courtesy.** Stock can be gone by checkout. The customer finds out then.
+6. **An admin stock update can overwrite a sale.** It sets a number. It does not add or subtract.
+7. **Checkouts for the same product queue up.** Each one holds that product's row until its transaction ends. Correct, and fast at this size, but it is a queue.
+8. **Coupon generation and the report count all orders on every call.**
+9. **The migration runner does not guard against two instances starting at the same moment.**
+10. **Carts are never cleaned up.** A lost response to `POST /carts` leaves an empty cart behind for good.
+11. **Typing stops at the SQL.** A misspelt column name is found by a test, not by the compiler.
+12. **I have only run one instance.** The concurrency tests send overlapping requests through one copy of the service. Each request uses its own database connection, so they do overlap in the database, which is where the guards are. But I have not run two copies side by side.
+
+## Multiple instances and production scale
+
+**Several instances.** Nothing that protects an invariant lives in the memory of the process. The locks are row locks and one advisory lock in PostgreSQL. The checks are conditional updates. The backstops are constraints. Two instances behind a load balancer meet in the database, so they behave like one.
+
+What I would change before running more than one:
+
+- **Migrations become a deploy step.** Today the container applies migrations when it starts. Two instances starting together could both try to apply the same file, and one would fail and restart.
+- **Connection pools need sizing.** Each instance opens up to 10 database connections, the driver's default. Many instances need a pooler such as PgBouncer in front of PostgreSQL. The advisory lock is held per transaction, so it works with transaction pooling.
+- **Timeouts.** I would set a lock timeout and a statement timeout, and return an error the client can retry.
+
+**More load.**
+
+- **A very popular product.** Checkouts that contain it wait for each other on that product's row. Each wait is one short transaction. For a flash sale I would look at reservations for that product, and accept the extra moving parts then.
+- **Counting orders.** With millions of orders I would keep running totals for the report and the milestone count, or run the report on a read replica. I would avoid one counter row that every checkout updates, because every checkout would then wait on the same row.
+- **Reads.** The product list and order lookups can go to read replicas. The cart view and checkout stay on the primary, because they need current prices and stock.
+- **Money columns** become `bigint`.
+- **The database** becomes a managed PostgreSQL with backups and failover. The code does not change for that. It relies on ordinary transactions, row locks and constraints, plus the one advisory lock.
+- **Around the service:** authentication, at least for `/admin`. Rate limiting. Structured logs with a request id. Metrics on how checkouts end. Cleanup of old open carts.
+
+## How I used AI
+
+I used Claude, an AI assistant, for the whole assignment. The split was this: **the AI wrote the code, the tests and the first draft of this file. I set the rules, made the design decisions, reviewed each part and corrected it.**
+
+**How the work was organised**
+
+- **Plan before code.** I had the AI go through every open question in the assignment and give me options, a recommendation and the trade-off for each. I accepted some, questioned some and changed some. No code was written until I had approved the plan.
+- **One part at a time.** Skeleton, carts, checkout, coupons, report, packaging. Each part came with its tests and its section of this file. I reviewed it and committed it myself. That is why the history is one commit per part.
+- **A log.** I had the AI keep a dated log of every point where I changed, rejected or questioned what it proposed. The examples below come from that log.
+
+**How the behaviour was validated**
+
+- The tests run against a real PostgreSQL. The ones that matter send competing or repeated requests.
+- For each guard, the AI removed the guard, confirmed that a test failed, and put it back. Where this file says "with the guard removed as a test", it quotes one of those runs. A guard that can be removed without a test failing is not tested.
+- The database constraints are a second line. For stock and for coupon generation, the constraint still stopped the bad write when the guard in the code was removed.
+- I ran the tests and the Docker setup on my own machine before submitting.
+
+**Where I corrected or redirected the AI**
+
+1. **Milestones when `n` changes.** The AI first said that changing `n` on a store that already has orders was not supported. I asked how the service should adapt, because a setting gets changed one day. Its next proposal was "the last rewarded milestone plus n". With coupons at orders 5 and 10 and a change to n = 3, that gives 13, 16, 19. I rejected it. A rule called "every nth order" should give multiples of n. The rule in the code is mine: the next multiple of the current `n` above the last milestone that has a coupon, which gives 12, 15, 18.
+2. **Price changes.** The AI recommended storing no price in the cart and charging the current price at checkout. I did not want a customer to learn about a price change from the bill. I designed what is built: the cart line records the price, checkout takes an acceptance flag that is false by default, and a changed price is refused with both prices. The AI then pointed out the gap in my design (a second change between the two calls) and offered a stricter version. I kept the simpler flag and wrote the gap down.
+3. **Migrations and seed data.** The AI proposed a single `schema.sql`. I wanted real migrations and a seeder. The result is numbered migration files with a small runner, and a seed script. I had asked for Prisma. That did not happen, for the reason given in the decision about plain SQL.
+4. **Smaller ones.** The currency: the AI proposed US dollars, I changed it to rupees. The API docs: I asked for Swagger UI, and where the AI planned to keep the OpenAPI document in a separate file, I chose to write it as comments above each route. The first version had no `.env.example`, and I asked for one.
+
+**Where the AI changed my mind**
+
+- I thought user accounts were missing, and proposed coupons per customer next to the administrator's coupons. The AI disagreed: the assignment has no accounts, and without authentication a coupon cannot really belong to anyone. I agreed. My reading is recorded as the alternative in the coupon section.
+- I proposed a table of checkout attempts, so that failed checkouts are kept as history. The AI argued that this belongs with a payment step. I agreed, and it is in the deferred list.
+
+Most of my corrections were to the design, before the code existed. Once the plan was fixed, the code needed few changes from me.
+
+## Time spent
+
+About 6 hours of my own time:
+
+- about 3 hours on planning: going through the open questions and settling the design before any code was written
+- about 2 hours on reviewing each part, running the service and the tests, and correcting
+- the rest on reading and correcting this file, and on the final checks
+
+The assignment asks for 4 to 6 hours, so I am at the top of that. The time on the clock was longer: one evening, from about 4 pm to after midnight. The AI built and tested each part while I waited, and I have not counted that waiting time.
+
+## With two more hours
+
+In this order:
+
+1. **Run two instances and attack them from outside.** Start two copies of the service behind a load balancer, and fire the oversell, same-cart and same-coupon cases at them with a load tool. My reasoning that several instances are safe is in this file, but I have only run one.
+2. **Close the price gap.** Let checkout take the subtotal the customer saw, and refuse if the service's own subtotal differs. It is a small change, and it removes the first item in the list of known weaknesses.
+3. **Timeouts and failure paths.** Set lock and statement timeouts. Test what a client sees when the database goes away in the middle of a checkout. The transaction is rolled back by design, but I have not tested that path.
+4. **A cleaner error if the generation lock is ever bypassed.** Today the unique constraint would then answer with a 500. It should be a 409.
