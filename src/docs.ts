@@ -27,6 +27,12 @@ export function buildOpenApiSpec(): object {
       tags: [
         { name: 'Products' },
         { name: 'Carts' },
+        { name: 'Checkout' },
+        { name: 'Orders' },
+        {
+          name: 'Admin',
+          description: 'Administrative operations. No authentication.',
+        },
         { name: 'Service' },
       ],
       components: {

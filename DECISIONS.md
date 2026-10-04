@@ -6,8 +6,8 @@ This file records how I designed the service and why. It grows with the code: ea
 
 The rules the service must never break, and where each one is enforced. The list grows as the parts are built.
 
-1. **Stock never goes below zero.**
-   In place so far: the database refuses it with `CHECK (stock >= 0)` on `products` (`migrations/001_create_products.sql`). Checkout, which is the code that takes stock, comes later and puts its own guard in front of this one. The database check stays as the backstop.
+1. **Stock is never oversold and never goes below zero.**
+   Checkout takes stock with one statement that checks and changes together: `UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1` (`takeStock` in `src/checkout.ts`). Backstop in the database: `CHECK (stock >= 0)` on `products`. With the first guard removed as a test, ten carts raced for three units and the database check still held: stock ended at zero with three orders, and the other seven requests failed with a 500 where the real code gives a clean 409.
 2. **The service never runs with an invalid coupon setting.**
    `n` must be a whole number of 1 or more. `x` must be a whole percent from 1 to 100. `src/config.ts` checks both at startup and the process exits if either is wrong.
 3. **Only valid lines enter a cart.**
@@ -15,7 +15,17 @@ The rules the service must never break, and where each one is enforced. The list
 4. **A product appears at most once in a cart.**
    The primary key of `cart_items` is `(cart_id, product_id)`. Saving the same product again updates that row.
 5. **A checked-out cart never changes.**
-   Every cart change first locks the cart row and reads its status under that lock (`lockOpenCart` in `src/carts.ts`). A cart that is not open is refused with `CART_ALREADY_CHECKED_OUT`. Checkout, when it is built, takes the same lock, so a cart cannot be changed while it is being checked out.
+   Every cart change first locks the cart row and reads its status under that lock (`lockOpenCart` in `src/carts.ts`). A cart that is not open is refused with `CART_ALREADY_CHECKED_OUT`. Checkout takes the same lock, so a cart cannot be changed while it is being checked out.
+6. **A cart gives at most one order.**
+   Checkout locks the cart row, and closes the cart in the same transaction that writes the order. Backstop in the database: `UNIQUE (cart_id)` on `orders`.
+7. **A retried checkout returns the same order and changes nothing.**
+   A checkout that finds the cart already checked out returns the stored order with status 200. It takes no stock and writes nothing.
+8. **A failed checkout changes nothing.**
+   Checkout is one database transaction. Any failure rolls all of it back: stock taken for other lines is given back, no order exists, and the cart is still open.
+9. **An order never changes and explains itself.**
+   An order stores its own copy of each product name, unit price, quantity and line total, plus subtotal, discount and total. Reading an order never touches the `products` table. The code has no statement that updates an order. Backstops in the database: `CHECK (total_paise = subtotal_paise - discount_paise)` and `CHECK (line_total_paise = unit_price_paise * quantity)`.
+10. **A changed price is not charged unless the client accepts it.**
+    Checkout compares the price recorded on each cart line with the current price, and refuses with `PRICE_CHANGED` unless the request says `accept_price_changes: true`. There is one known gap, described under that decision.
 
 ## Decision: PostgreSQL, not an in-memory store
 
@@ -92,7 +102,7 @@ The rules the service must never break, and where each one is enforced. The list
 
 Saving a line again records the current price. That is how a client accepts a new price before checkout. Viewing the cart never changes anything.
 
-The other half of this decision is at checkout: a changed price is refused unless the client says it accepts it. That part is described in the checkout section, when it is built.
+The other half of this decision is at checkout: a changed price is refused unless the client says it accepts it. See "Accepting a changed price at checkout" below.
 
 **Why:** The customer is told about the change, and the store still sells at its current price.
 
@@ -105,11 +115,111 @@ The same sentence in the assignment also covers availability.
 - Saving a line checks the quantity against the stock at that moment. Asking for more than is in stock is refused with `INSUFFICIENT_STOCK`, and the details say how many were asked for and how many are left.
 - This check is a courtesy. It holds nothing. Two carts can both contain the last three units. Holding stock when an item is added would need an expiry and a cleanup job for abandoned carts, which I decided was more than this service needs.
 - If stock later drops below a line's quantity, the cart view flags that line with `insufficient_stock` and shows `available_stock`, so a client can warn the customer before checkout.
-- The check that really protects stock is at checkout. It is described in the checkout section, when it is built.
+- The check that really protects stock is at checkout. See "Stock is taken at checkout, all or nothing" below.
 
 ## Cart ids
 
 There is no login, so the cart id is the only thing that protects a cart. Cart ids are random UUIDs and not counting numbers, so one customer cannot guess another customer's cart.
+
+## Checkout: transaction, concurrency and retries
+
+Checkout is the one place where several things must change together, so it runs as one database transaction (`checkout` in `src/checkout.ts`). The steps:
+
+1. Lock the cart row.
+2. If the cart is already checked out, return its order and stop. This is the retry case.
+3. Read the cart lines in product id order. No lines: `CART_EMPTY`.
+4. Take the stock for every line. If any line is short: `INSUFFICIENT_STOCK`, listing every short product.
+5. Compare each recorded price with the current price. A difference that was not accepted: `PRICE_CHANGED`.
+6. Write the order and its lines.
+7. Mark the cart as checked out.
+
+If any step fails, the transaction rolls back and nothing has changed. When several things are wrong at once, the client gets the first one in this order: empty cart, then stock, then price.
+
+**How overlapping requests are kept correct.** I use PostgreSQL's default isolation level (read committed). The safety does not come from a stricter level. It comes from two things:
+
+- **Row locks.** Step 1 uses `SELECT ... FOR UPDATE` on the cart. A second request for the same cart waits there until the first one commits or rolls back, and then reads what the first one left behind.
+- **Check and change in one statement.** Step 4 does not read the stock and then decide. The `UPDATE` only matches a row that still has enough stock, and the database locks that row while it runs. A second checkout waits for the first, re-checks against the new stock, and matches nothing if the stock is gone.
+
+What happens in each overlap:
+
+| Situation | Outcome |
+|---|---|
+| Ten carts check out the last 3 units at the same moment | Exactly 3 orders. The other 7 get `INSUFFICIENT_STOCK`, their carts stay open, stock ends at 0. |
+| The same cart is checked out twice at the same moment | The second waits at step 1, then finds the cart checked out and returns the first one's order with 200. One order, stock taken once. |
+| A checkout is retried after it succeeded | Same order, status 200, nothing changes. |
+| A checkout is retried after it failed | It is simply evaluated again. The failed attempt left nothing behind. |
+| A cart line is changed while that cart is being checked out | Whichever takes the cart lock first goes first. Either the change is in the order, or the change is refused with `CART_ALREADY_CHECKED_OUT`. A line can never end up in a closed cart without being in its order. |
+| Two carts with the same two products check out together | Both lock the product rows in product id order, so they cannot deadlock. With that ordering removed as a test, real deadlocks occurred. |
+
+Each row of this table has a test in `test/checkout.test.ts`.
+
+## Decision: The cart itself makes checkout safe to retry
+
+**Context:** A client may retry a checkout because it timed out or never got the response. The retry must not create a second order or take stock twice.
+
+**Options considered:**
+- An `Idempotency-Key` header. The client sends a random key with each attempt, and the server stores the key with the response and replays it. This is the general pattern payment APIs use. It needs a table of keys, a rule for the same key arriving with a different body, handling for a request that is still running, and expiry.
+- Use the cart. The assignment already says a cart must not be checked out more than once, so `POST /carts/{cartId}/checkout` names exactly one checkout.
+
+**Choice:** The cart. The first successful checkout returns 201. Any later checkout of that cart returns the same order with 200.
+
+**Why:** The rule "one order per cart" has to exist anyway, and it already answers the retry question. A separate key would be a second mechanism guarding the same thing.
+
+**Consequences:** It only covers checkout. That is the only call that needs it: setting a cart line and removing one are safe to repeat by design, and creating an empty cart twice does no harm. A general idempotency key is what I would add for other non-repeatable calls in a larger API.
+
+## Decision: Stock is taken at checkout, all or nothing
+
+**Context:** The service must never sell more than it has, also when checkouts overlap. I had to decide when stock is taken and what happens when it runs short.
+
+**Options considered:**
+- Hold stock when an item is added to a cart. No surprise at checkout, but abandoned carts would hold stock, so it needs expiry and a cleanup job.
+- Take stock at checkout and sell whatever is available. The customer gets an order they did not ask for.
+- Take stock at checkout, and fail the whole checkout if any line cannot be supplied in full.
+
+**Choice:** The third. If any line is short, the checkout fails with `INSUFFICIENT_STOCK`. `details.items` lists every short product with the quantity asked for and the quantity left, so the customer can fix the cart in one go and try again.
+
+**Why:** It is the smallest design that can never oversell, and it never gives the customer something different from what they asked for.
+
+**Consequences:** "It was in stock when I added it" can happen. The cart view flags it before checkout, but only if the client looks.
+
+## Decision: Accepting a changed price at checkout
+
+**Context:** This is the second half of "the cart records the price it showed". The cart view tells the customer about a price change. Checkout has to make sure they cannot be charged the new price without having agreed to it.
+
+**Options considered:**
+- Charge the current price and say nothing. The response shows what was charged, but only afterwards.
+- A flag on checkout. If a price changed and the flag is not set, refuse and report the old and new prices. The client shows them, and calls again with the flag set.
+- The client sends the subtotal it expects, and the server refuses if its own subtotal differs.
+
+**Choice:** The flag. Checkout takes `accept_price_changes`, false by default. If a recorded price differs from the current price and the flag is false, checkout fails with `PRICE_CHANGED` and lists each product with both prices. Nothing is written. With the flag true, the order is placed at the current prices.
+
+A client can also accept a new price before checkout by saving that cart line again, which records the current price.
+
+**Why:** It is simple to call and to explain, and by default nobody pays a price they were not shown.
+
+**Consequences, including a known gap:** The flag means "I accept whatever the price is now". It does not say which price the customer saw. If a price changes a second time between the `PRICE_CHANGED` response and the accepting call, the customer pays the newer price without having seen it. The window is a few seconds and needs two price changes on the same product, but it is real. Sending the expected subtotal closes it, at the cost of every checkout call having to carry that number. I chose the simpler call and am naming the gap here.
+
+## Decision: No payment step
+
+**Context:** The assignment allows treating a successful checkout as payment success, or adding a small payment fake, and asks for the choice to be explained.
+
+**Options considered:**
+- No payment step. A successful checkout counts as paid.
+- A fake payment call inside checkout that tests can make fail.
+
+**Choice:** No payment step.
+
+**Why:** Without a payment, checkout can be one database transaction, and "a failed checkout changes nothing" is simply a rollback. A fake payment inside that transaction would look like it proves more, but it would be modelling something that is not true: a real payment is a network call to another company, and it cannot sit inside a database transaction.
+
+**Consequences:** A real payment changes the shape of checkout. The order would be created as pending, with the stock and any coupon held. The payment would then be attempted outside the transaction, each attempt recorded in its own table so it can be reconciled with the gateway. On success the order is confirmed. On failure or timeout the holds are released. That design also needs an expiry for orders that stay pending. None of that is built here.
+
+## Admin: changing a product's price or stock
+
+`PATCH /admin/products/{productId}` sets the price, the stock, or both. I added it so the price-change and stock-change behaviour can be exercised through the API, not only with SQL.
+
+- Carts are not touched. They show the change the next time they are viewed, and checkout deals with it.
+- Orders never change.
+- The stock is set to the number given. A real inventory system would record movements (received 10, sold 1) so that a stock update and a sale at the same moment cannot overwrite each other. Here the last write wins.
 
 ## Money and rounding rules
 
@@ -138,15 +248,20 @@ Codes so far:
 
 | Status | Code | When |
 |---|---|---|
-| 400 | `VALIDATION_ERROR` | The body is not valid JSON, a quantity is not a whole number of 1 or more, or an id in the URL is malformed. The details list what was wrong. |
+| 400 | `VALIDATION_ERROR` | The body is not valid JSON, a field has the wrong type or value, the body has a field the service does not know, or an id in the URL is malformed. The details list what was wrong. |
 | 404 | `ROUTE_NOT_FOUND` | No such route |
 | 404 | `CART_NOT_FOUND` | No cart with that id |
 | 404 | `PRODUCT_NOT_FOUND` | No product with that id |
+| 404 | `ORDER_NOT_FOUND` | No order with that id |
 | 409 | `CART_ALREADY_CHECKED_OUT` | A change was sent to a cart that has been checked out |
-| 409 | `INSUFFICIENT_STOCK` | The quantity asked for is more than is in stock |
+| 409 | `CART_EMPTY` | Checkout of a cart with no items |
+| 409 | `INSUFFICIENT_STOCK` | A quantity is more than is in stock. `details.items` lists each product with `requested` and `available`. |
+| 409 | `PRICE_CHANGED` | A price changed since the line was saved and was not accepted. `details.items` lists each product with both prices. |
 | 500 | `INTERNAL_ERROR` | Anything unexpected |
 
 Each later part adds its own.
+
+**Unknown fields are refused.** A request body with a field the service does not know gets a 400. It is not ignored. The reason is checkout: a misspelt field there would otherwise be dropped silently, and the customer would get an order they did not intend.
 
 **Alternatives considered:**
 - RFC 9457 `application/problem+json`. It is a standard, but it has more fields for the same information.
@@ -156,7 +271,6 @@ Each later part adds its own.
 
 These sections are added as the parts are built:
 
-- Checkout: the transaction, concurrency and retries, and accepting a changed price
 - Coupons and milestones, including the discount rounding rule
 - The report
 - Ambiguities I found and the meaning I chose

@@ -22,9 +22,11 @@ export function createTestApp(pool: Pool): Express {
   return createApp({ pool });
 }
 
-// Puts the database back to a known state: no carts, and only the six seed
-// products with their seed prices and stock.
+// Puts the database back to a known state: no orders, no carts, and only the
+// six seed products with their seed prices and stock.
 export async function resetDatabase(pool: Pool): Promise<void> {
-  await pool.query('TRUNCATE cart_items, carts, products');
+  await pool.query(
+    'TRUNCATE order_items, orders, cart_items, carts, products',
+  );
   await seedDatabase(pool);
 }

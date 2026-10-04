@@ -45,6 +45,7 @@ describe('creating and viewing a cart', () => {
     expect(res.body.id).toMatch(/^[0-9a-f-]{36}$/);
     expect(res.body).toMatchObject({
       status: 'open',
+      order_id: null,
       items: [],
       subtotal_paise: 0,
     });
@@ -58,6 +59,7 @@ describe('creating and viewing a cart', () => {
     expect(res.body).toEqual({
       id: cartId,
       status: 'open',
+      order_id: null,
       items: [],
       subtotal_paise: 0,
     });
@@ -139,6 +141,7 @@ describe('PUT /carts/{cartId}/items/{productId}', () => {
     ['text', { quantity: '3' }],
     ['missing', {}],
     ['null', { quantity: null }],
+    ['sent with an unknown extra field', { quantity: 1, qty: 5 }],
   ])('refuses a quantity that is %s', async (_label, body) => {
     const cartId = await newCartId();
 
@@ -183,9 +186,7 @@ describe('stock when saving a line', () => {
     expect(res.status).toBe(409);
     expect(res.body.error.code).toBe('INSUFFICIENT_STOCK');
     expect(res.body.error.details).toEqual({
-      product_id: 6,
-      requested: 4,
-      available: 3,
+      items: [{ product_id: 6, requested: 4, available: 3 }],
     });
     const view = await request(app).get(`/carts/${cartId}`);
     expect(view.body.items).toEqual([]);

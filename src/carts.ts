@@ -23,9 +23,13 @@ export type CartItemView = {
   insufficient_stock: boolean;
 };
 
+export type CartStatus = 'open' | 'checked_out';
+
 export type CartView = {
   id: string;
-  status: 'open' | 'checked_out';
+  status: CartStatus;
+  // The order created from this cart. null while the cart is still open.
+  order_id: string | null;
   items: CartItemView[];
   subtotal_paise: number;
 };
@@ -34,14 +38,23 @@ export async function createCart(pool: Pool): Promise<CartView> {
   const { rows } = await pool.query<{ id: string }>(
     'INSERT INTO carts DEFAULT VALUES RETURNING id',
   );
-  return { id: rows[0]!.id, status: 'open', items: [], subtotal_paise: 0 };
+  return {
+    id: rows[0]!.id,
+    status: 'open',
+    order_id: null,
+    items: [],
+    subtotal_paise: 0,
+  };
 }
 
 // Reads a cart with its lines. Prices and stock come from the products table
 // at the time of the call, so the view always shows the current situation.
 export async function getCart(db: Db, cartId: string): Promise<CartView> {
-  const cart = await db.query<{ status: CartView['status'] }>(
-    'SELECT status FROM carts WHERE id = $1',
+  const cart = await db.query<{ status: CartStatus; order_id: string | null }>(
+    `SELECT c.status, o.id AS order_id
+       FROM carts c
+       LEFT JOIN orders o ON o.cart_id = c.id
+      WHERE c.id = $1`,
     [cartId],
   );
   if (cart.rows.length === 0) {
@@ -85,6 +98,7 @@ export async function getCart(db: Db, cartId: string): Promise<CartView> {
   return {
     id: cartId,
     status: cart.rows[0]!.status,
+    order_id: cart.rows[0]!.order_id,
     items,
     subtotal_paise: items.reduce((sum, item) => sum + item.line_total_paise, 0),
   };
@@ -124,7 +138,11 @@ export async function setCartItem(
         409,
         'INSUFFICIENT_STOCK',
         `Only ${stock} of product ${productId} in stock.`,
-        { product_id: productId, requested: quantity, available: stock },
+        {
+          items: [
+            { product_id: productId, requested: quantity, available: stock },
+          ],
+        },
       );
     }
 
@@ -160,19 +178,31 @@ export async function removeCartItem(
   });
 }
 
-// Every change to a cart starts here. FOR UPDATE locks the cart row until the
-// transaction ends, so two changes to the same cart run one after the other.
-// A cart that was already checked out is refused. Because the status is read
-// under the lock, a cart cannot be changed while it is being checked out.
-async function lockOpenCart(client: PoolClient, cartId: string): Promise<void> {
-  const { rows } = await client.query<{ status: CartView['status'] }>(
+// Locks the cart row and returns the cart's status.
+// FOR UPDATE holds the lock until the transaction ends. A second transaction
+// that wants the same cart waits here, and when it gets the lock it reads the
+// status the first one left behind. Cart changes and checkout both start with
+// this, so for one cart they always run one after the other.
+export async function lockCart(
+  client: PoolClient,
+  cartId: string,
+): Promise<CartStatus> {
+  const { rows } = await client.query<{ status: CartStatus }>(
     'SELECT status FROM carts WHERE id = $1 FOR UPDATE',
     [cartId],
   );
   if (rows.length === 0) {
     throw cartNotFound(cartId);
   }
-  if (rows[0]!.status !== 'open') {
+  return rows[0]!.status;
+}
+
+// Every change to a cart starts here. A cart that was already checked out is
+// refused. Because the status is read under the lock, a cart cannot be
+// changed while it is being checked out.
+async function lockOpenCart(client: PoolClient, cartId: string): Promise<void> {
+  const status = await lockCart(client, cartId);
+  if (status !== 'open') {
     throw new AppError(
       409,
       'CART_ALREADY_CHECKED_OUT',

@@ -2,7 +2,7 @@
 
 Backend for a small store: carts, checkout, orders, inventory and discount coupons.
 
-**Status: in progress.** The work lands in small slices and this README grows with it. So far: project setup, database migrations, seed data, the product list, carts and the API docs page. Checkout, orders, coupons and the report are still to come.
+**Status: in progress.** The work lands in small slices and this README grows with it. So far: project setup, database migrations, seed data, the product list, carts, checkout, orders and the API docs page. Coupons and the report are still to come.
 
 The design choices and the reasons for them are in [DECISIONS.md](DECISIONS.md).
 
@@ -66,6 +66,9 @@ The service, `npm run migrate`, `npm run seed` and `npm test` all read `.env` if
 | `GET /carts/{cartId}` | Shows the cart with current prices, totals and stock |
 | `PUT /carts/{cartId}/items/{productId}` | Adds a product or changes its quantity. Body: `{ "quantity": 2 }` |
 | `DELETE /carts/{cartId}/items/{productId}` | Removes a product from the cart |
+| `POST /carts/{cartId}/checkout` | Places the order. Optional body: `{ "accept_price_changes": true }`. Safe to retry: a second call returns the same order. |
+| `GET /orders/{orderId}` | Shows an order with its lines and totals |
+| `PATCH /admin/products/{productId}` | Administrative. Changes a product's price or stock. Body: `{ "price_paise": 69900 }`, `{ "stock": 50 }` or both |
 | `GET /docs` | Swagger UI, with every request, response and error |
 | `GET /docs.json` | The OpenAPI document |
 

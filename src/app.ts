@@ -7,8 +7,11 @@ import express, {
 import type { Pool } from 'pg';
 import { mountDocs } from './docs';
 import { AppError } from './errors';
+import { adminRouter } from './routes/admin';
 import { cartsRouter } from './routes/carts';
+import { checkoutRouter } from './routes/checkout';
 import { healthRouter } from './routes/health';
+import { ordersRouter } from './routes/orders';
 import { productsRouter } from './routes/products';
 
 export type AppDeps = {
@@ -24,6 +27,9 @@ export function createApp({ pool }: AppDeps): Express {
   app.use(healthRouter(pool));
   app.use(productsRouter(pool));
   app.use(cartsRouter(pool));
+  app.use(checkoutRouter(pool));
+  app.use(ordersRouter(pool));
+  app.use(adminRouter(pool));
   mountDocs(app);
 
   // No route matched.

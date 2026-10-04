@@ -27,6 +27,7 @@ describe('migrations', () => {
       expect.arrayContaining([
         '001_create_products.sql',
         '002_create_carts.sql',
+        '003_create_orders.sql',
       ]),
     );
   });

@@ -74,6 +74,11 @@ import {
  *         status:
  *           type: string
  *           enum: [open, checked_out]
+ *         order_id:
+ *           type: string
+ *           format: uuid
+ *           nullable: true
+ *           description: The order created from this cart. null while the cart is open.
  *         items:
  *           type: array
  *           items:
@@ -192,7 +197,7 @@ export function cartsRouter(pool: Pool): Router {
    *       409:
    *         description: >
    *           CART_ALREADY_CHECKED_OUT, or INSUFFICIENT_STOCK when the quantity
-   *           is more than is in stock right now. The details give the
+   *           is more than is in stock right now. details.items gives the
    *           quantity requested and the quantity available.
    *         content:
    *           application/json:
