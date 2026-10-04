@@ -26,6 +26,7 @@ export function buildOpenApiSpec(): object {
       },
       tags: [
         { name: 'Products' },
+        { name: 'Carts' },
         { name: 'Service' },
       ],
       components: {

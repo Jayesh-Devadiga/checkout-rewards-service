@@ -23,8 +23,11 @@ describe('migrations', () => {
     const { rows } = await pool.query(
       'SELECT filename FROM schema_migrations ORDER BY filename',
     );
-    expect(rows.map((row) => row.filename)).toContain(
-      '001_create_products.sql',
+    expect(rows.map((row) => row.filename)).toEqual(
+      expect.arrayContaining([
+        '001_create_products.sql',
+        '002_create_carts.sql',
+      ]),
     );
   });
 

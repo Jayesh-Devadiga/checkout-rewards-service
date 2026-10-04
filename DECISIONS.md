@@ -10,6 +10,12 @@ The rules the service must never break, and where each one is enforced. The list
    In place so far: the database refuses it with `CHECK (stock >= 0)` on `products` (`migrations/001_create_products.sql`). Checkout, which is the code that takes stock, comes later and puts its own guard in front of this one. The database check stays as the backstop.
 2. **The service never runs with an invalid coupon setting.**
    `n` must be a whole number of 1 or more. `x` must be a whole percent from 1 to 100. `src/config.ts` checks both at startup and the process exits if either is wrong.
+3. **Only valid lines enter a cart.**
+   The product must exist. The quantity must be a whole number of 1 or more, and not more than the stock at that moment. Enforced by the request checks in `src/validation.ts` and by `setCartItem` in `src/carts.ts`. Backstops in the database: the foreign key to `products` and `CHECK (quantity > 0)` on `cart_items`.
+4. **A product appears at most once in a cart.**
+   The primary key of `cart_items` is `(cart_id, product_id)`. Saving the same product again updates that row.
+5. **A checked-out cart never changes.**
+   Every cart change first locks the cart row and reads its status under that lock (`lockOpenCart` in `src/carts.ts`). A cart that is not open is refused with `CART_ALREADY_CHECKED_OUT`. Checkout, when it is built, takes the same lock, so a cart cannot be changed while it is being checked out.
 
 ## Decision: PostgreSQL, not an in-memory store
 
@@ -59,6 +65,52 @@ The rules the service must never break, and where each one is enforced. The list
 
 **Consequences:** Changing `n` or `x` needs a restart. What a change in `n` means for coupons already earned is described in the coupon section, when that part is built.
 
+## Decision: One call sets the quantity of a cart line
+
+**Context:** The assignment asks for adding an item, changing its quantity and removing it. It also says clients may retry a request after a timeout. An "add" that increases the quantity would add twice on a retry.
+
+**Options considered:**
+- `POST` to add, which increases the quantity, and `PATCH` to change it. This matches the wording of the assignment. A retried `POST` adds twice unless extra protection is built.
+- `PUT /carts/{cartId}/items/{productId}` with `{ "quantity": n }`, which sets the quantity to exactly `n`.
+
+**Choice:** `PUT` sets the quantity. If the product is not in the cart it is added, otherwise the line is updated. `DELETE` on the same path removes the line.
+
+**Why:** The same request sent twice gives the same cart, so a retry is safe with nothing extra to build. There is also one way to do each thing: a quantity of 0 is refused, because removing is what `DELETE` is for. Removing a line that is not there returns the cart as it is, for the same reason.
+
+**Consequences:** There is no "add one more". The client sends the total quantity it wants. Adding and changing are the same endpoint, and the API docs say so.
+
+## Decision: The cart records the price it showed
+
+**Context:** The assignment says: decide and document what happens when a price changes after an item was added but before checkout. A cart can sit for hours or days. If the price changes in that time, the customer should not find out from the bill.
+
+**Options considered:**
+- Store no price in the cart and charge the current price at checkout. Simple, but the customer can pay a price they never saw.
+- Freeze the price when the item is added and honour it. Kind to the customer, but the store sells at old prices, and a cart can be parked to hold a low price.
+- Record the price on the cart line, show the customer when it has changed, and make them accept the new price before the order is placed.
+
+**Choice:** The third. A cart line stores the unit price at the moment the line is saved. The cart view returns `recorded_unit_price_paise`, `current_unit_price_paise` and a `price_changed` flag for every line. Line totals and the subtotal use the current price, because that is what checkout would charge.
+
+Saving a line again records the current price. That is how a client accepts a new price before checkout. Viewing the cart never changes anything.
+
+The other half of this decision is at checkout: a changed price is refused unless the client says it accepts it. That part is described in the checkout section, when it is built.
+
+**Why:** The customer is told about the change, and the store still sells at its current price.
+
+**Consequences:** One extra column on the cart line, and the cart view does a little more work.
+
+## Stock changes before checkout
+
+The same sentence in the assignment also covers availability.
+
+- Saving a line checks the quantity against the stock at that moment. Asking for more than is in stock is refused with `INSUFFICIENT_STOCK`, and the details say how many were asked for and how many are left.
+- This check is a courtesy. It holds nothing. Two carts can both contain the last three units. Holding stock when an item is added would need an expiry and a cleanup job for abandoned carts, which I decided was more than this service needs.
+- If stock later drops below a line's quantity, the cart view flags that line with `insufficient_stock` and shows `available_stock`, so a client can warn the customer before checkout.
+- The check that really protects stock is at checkout. It is described in the checkout section, when it is built.
+
+## Cart ids
+
+There is no login, so the cart id is the only thing that protects a cart. Cart ids are random UUIDs and not counting numbers, so one customer cannot guess another customer's cart.
+
 ## Money and rounding rules
 
 - Every amount is a whole number of paise (100 paise = 1 rupee). That holds in the database (`price_paise integer`), in the code and in the API. `64900` means Rs 649.00.
@@ -82,7 +134,19 @@ Every error response has one shape:
   - **409**: the request is valid, but the current state refuses it.
 - Anything unexpected returns **500** with `INTERNAL_ERROR`. The real error goes to the server log and is never sent to the client.
 
-Codes so far: `ROUTE_NOT_FOUND`, `VALIDATION_ERROR`, `INTERNAL_ERROR`. Each later part adds its own.
+Codes so far:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | The body is not valid JSON, a quantity is not a whole number of 1 or more, or an id in the URL is malformed. The details list what was wrong. |
+| 404 | `ROUTE_NOT_FOUND` | No such route |
+| 404 | `CART_NOT_FOUND` | No cart with that id |
+| 404 | `PRODUCT_NOT_FOUND` | No product with that id |
+| 409 | `CART_ALREADY_CHECKED_OUT` | A change was sent to a cart that has been checked out |
+| 409 | `INSUFFICIENT_STOCK` | The quantity asked for is more than is in stock |
+| 500 | `INTERNAL_ERROR` | Anything unexpected |
+
+Each later part adds its own.
 
 **Alternatives considered:**
 - RFC 9457 `application/problem+json`. It is a standard, but it has more fields for the same information.
@@ -92,8 +156,7 @@ Codes so far: `ROUTE_NOT_FOUND`, `VALIDATION_ERROR`, `INTERNAL_ERROR`. Each late
 
 These sections are added as the parts are built:
 
-- Carts, and what happens when a price or stock changes before checkout
-- Checkout: the transaction, concurrency and retries
+- Checkout: the transaction, concurrency and retries, and accepting a changed price
 - Coupons and milestones, including the discount rounding rule
 - The report
 - Ambiguities I found and the meaning I chose
