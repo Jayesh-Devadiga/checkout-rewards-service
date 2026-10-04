@@ -1,3 +1,10 @@
+# docker compose up --build --wait     starts the database and the service
+# docker compose up -d --wait db       starts only the database (for npm run dev)
+# docker compose run --rm --build test runs the tests inside Docker
+#
+# Compose reads a .env file in this folder if there is one, so PORT,
+# COUPON_EVERY_N_ORDERS and COUPON_DISCOUNT_PERCENT can be set there.
+
 services:
   db:
     image: postgres:16-alpine
@@ -15,3 +22,47 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  app:
+    build: .
+    environment:
+      PORT: 3000
+      # Inside Compose the database is reached by its service name "db" and
+      # its own port 5432, not through the host's 5433.
+      DATABASE_URL: postgres://checkout:checkout@db:5432/checkout
+      # n and x. The value after ":-" is used when the variable is not set.
+      COUPON_EVERY_N_ORDERS: ${COUPON_EVERY_N_ORDERS:-5}
+      COUPON_DISCOUNT_PERCENT: ${COUPON_DISCOUNT_PERCENT:-10}
+    ports:
+      - "${PORT:-3000}:3000"
+    depends_on:
+      db:
+        # Wait until PostgreSQL accepts connections, not just until its
+        # container has started.
+        condition: service_healthy
+    healthcheck:
+      # Calls the service's own /health route, which also checks the database.
+      # This is what "docker compose up --wait" waits for.
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Runs the test suite. It has a profile, so "docker compose up" does not
+  # start it. It only runs when asked for by name.
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      # The first stage of the Dockerfile, which has the test tools.
+      target: build
+    environment:
+      TEST_DATABASE_URL: postgres://checkout:checkout@db:5432/checkout_test
+    depends_on:
+      db:
+        condition: service_healthy
+    command: npm test

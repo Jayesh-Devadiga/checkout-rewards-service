@@ -1,0 +1,9 @@
+# Not copied into the Docker image.
+# node_modules and dist are built inside the image, for the image's own
+# operating system. .env is local to one machine and must not be baked in.
+node_modules
+dist
+coverage
+.git
+.env
+*.log
