@@ -18,8 +18,14 @@ export function checkoutRouter(pool: Pool): Router {
    *       is still open and unchanged.
    *
    *       Safe to retry. A cart is checked out at most once. If the cart
-   *       already has an order, that order is returned with status 200 and
-   *       nothing changes.
+   *       already has an order and the request names the same coupon as that
+   *       order (or no coupon both times), the order is returned with status
+   *       200 and nothing changes. A different coupon is refused with
+   *       CART_ALREADY_CHECKED_OUT.
+   *
+   *       A coupon takes its percent off the order subtotal, rounded down to
+   *       the paisa. A coupon can be used once. If the checkout fails for any
+   *       reason, the coupon is not used up.
    *
    *       If a price changed since a line was saved, the checkout is refused
    *       with PRICE_CHANGED and the old and new prices. Send
@@ -38,6 +44,10 @@ export function checkoutRouter(pool: Pool): Router {
    *                 type: boolean
    *                 default: false
    *                 description: Accept prices that changed since the lines were saved
+   *               coupon_code:
+   *                 type: string
+   *                 description: A coupon code from POST /admin/coupons
+   *                 example: K7M2Q9XDPA
    *     responses:
    *       201:
    *         description: The order was placed
@@ -62,7 +72,7 @@ export function checkoutRouter(pool: Pool): Router {
    *             schema:
    *               $ref: '#/components/schemas/Error'
    *       404:
-   *         description: CART_NOT_FOUND
+   *         description: CART_NOT_FOUND, or COUPON_NOT_FOUND for an unknown coupon code
    *         content:
    *           application/json:
    *             schema:
@@ -70,6 +80,10 @@ export function checkoutRouter(pool: Pool): Router {
    *       409:
    *         description: >
    *           CART_EMPTY when the cart has no items.
+   *           COUPON_ALREADY_REDEEMED when the coupon was used before.
+   *           CART_ALREADY_CHECKED_OUT when the cart already has an order
+   *           that was placed with a different coupon. details.order_id is
+   *           that order.
    *           INSUFFICIENT_STOCK when any item cannot be supplied in full.
    *           details.items lists each short product with requested and
    *           available.
@@ -92,6 +106,7 @@ export function checkoutRouter(pool: Pool): Router {
 
     const result = await checkout(pool, cartId, {
       acceptPriceChanges: body.accept_price_changes ?? false,
+      couponCode: body.coupon_code ?? null,
     });
 
     // 201 for a new order, 200 when a retry gets the existing order back.

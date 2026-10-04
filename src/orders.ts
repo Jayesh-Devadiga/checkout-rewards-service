@@ -18,6 +18,8 @@ export type OrderView = {
   created_at: Date;
   items: OrderItemView[];
   subtotal_paise: number;
+  // The coupon used, or null. Copied onto the order when it was placed.
+  coupon_code: string | null;
   discount_percent: number;
   discount_paise: number;
   total_paise: number;
@@ -25,7 +27,7 @@ export type OrderView = {
 
 type OrderRow = Omit<OrderView, 'items'>;
 
-const ORDER_COLUMNS = `id, cart_id, created_at, subtotal_paise,
+const ORDER_COLUMNS = `id, cart_id, created_at, subtotal_paise, coupon_code,
                        discount_percent, discount_paise, total_paise`;
 
 export async function getOrder(db: Db, orderId: string): Promise<OrderView> {
@@ -57,7 +59,7 @@ export async function findOrderByCartId(
 }
 
 // Everything comes from the orders and order_items tables. Nothing is read
-// from products, so a later change to a product cannot change an order.
+// from products or coupons, so a later change there cannot change an order.
 async function withItems(db: Db, order: OrderRow): Promise<OrderView> {
   const { rows: items } = await db.query<OrderItemView>(
     `SELECT product_id, product_name, unit_price_paise, quantity, line_total_paise
@@ -72,6 +74,7 @@ async function withItems(db: Db, order: OrderRow): Promise<OrderView> {
     created_at: order.created_at,
     items,
     subtotal_paise: order.subtotal_paise,
+    coupon_code: order.coupon_code,
     discount_percent: order.discount_percent,
     discount_paise: order.discount_paise,
     total_paise: order.total_paise,

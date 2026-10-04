@@ -18,15 +18,28 @@ export function createTestPool(): Pool {
   return createPool(TEST_DATABASE_URL);
 }
 
-export function createTestApp(pool: Pool): Express {
-  return createApp({ pool });
+// The coupon settings used by the tests unless a test passes its own:
+// a coupon every 5 orders, 10% off.
+export const TEST_COUPON_CONFIG = {
+  couponEveryNOrders: 5,
+  couponDiscountPercent: 10,
+};
+
+export function createTestApp(
+  pool: Pool,
+  couponConfig: Partial<typeof TEST_COUPON_CONFIG> = {},
+): Express {
+  return createApp({
+    pool,
+    config: { ...TEST_COUPON_CONFIG, ...couponConfig },
+  });
 }
 
 // Puts the database back to a known state: no orders, no carts, and only the
 // six seed products with their seed prices and stock.
 export async function resetDatabase(pool: Pool): Promise<void> {
   await pool.query(
-    'TRUNCATE order_items, orders, cart_items, carts, products',
+    'TRUNCATE order_items, orders, coupons, cart_items, carts, products RESTART IDENTITY',
   );
   await seedDatabase(pool);
 }

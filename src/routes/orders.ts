@@ -48,12 +48,17 @@ import { orderIdSchema, parseOrThrow } from '../validation';
  *           type: integer
  *           description: Sum of the line totals, before any discount
  *           example: 129800
+ *         coupon_code:
+ *           type: string
+ *           nullable: true
+ *           description: The coupon used on this order, or null
  *         discount_percent:
  *           type: integer
  *           description: Percent taken off the subtotal. 0 when no coupon was used.
  *           example: 0
  *         discount_paise:
  *           type: integer
+ *           description: subtotal_paise times discount_percent, divided by 100 and rounded down
  *           example: 0
  *         total_paise:
  *           type: integer

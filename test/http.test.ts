@@ -11,7 +11,12 @@ import {
   vi,
 } from 'vitest';
 import { createApp } from '../src/app';
-import { createTestApp, createTestPool, resetDatabase } from './helpers';
+import {
+  createTestApp,
+  createTestPool,
+  resetDatabase,
+  TEST_COUPON_CONFIG,
+} from './helpers';
 
 let pool: Pool;
 let app: Express;
@@ -89,7 +94,10 @@ describe('error shape', () => {
     const brokenPool = {
       query: () => Promise.reject(new Error('password is hunter2')),
     } as unknown as Pool;
-    const brokenApp = createApp({ pool: brokenPool });
+    const brokenApp = createApp({
+      pool: brokenPool,
+      config: TEST_COUPON_CONFIG,
+    });
     const logged = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     const res = await request(brokenApp).get('/health');

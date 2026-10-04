@@ -5,6 +5,7 @@ import express, {
   type Response,
 } from 'express';
 import type { Pool } from 'pg';
+import type { Config } from './config';
 import { mountDocs } from './docs';
 import { AppError } from './errors';
 import { adminRouter } from './routes/admin';
@@ -16,11 +17,13 @@ import { productsRouter } from './routes/products';
 
 export type AppDeps = {
   pool: Pool;
+  // n and x, the two coupon settings.
+  config: Pick<Config, 'couponEveryNOrders' | 'couponDiscountPercent'>;
 };
 
-// Builds the Express app. The database pool is passed in, so tests can hand
-// it a pool that points at the test database.
-export function createApp({ pool }: AppDeps): Express {
+// Builds the Express app. The database pool and the settings are passed in,
+// so tests can hand it the test database and their own n and x.
+export function createApp({ pool, config }: AppDeps): Express {
   const app = express();
   app.use(express.json());
 
@@ -29,7 +32,12 @@ export function createApp({ pool }: AppDeps): Express {
   app.use(cartsRouter(pool));
   app.use(checkoutRouter(pool));
   app.use(ordersRouter(pool));
-  app.use(adminRouter(pool));
+  app.use(
+    adminRouter(pool, {
+      everyNOrders: config.couponEveryNOrders,
+      discountPercent: config.couponDiscountPercent,
+    }),
+  );
   mountDocs(app);
 
   // No route matched.

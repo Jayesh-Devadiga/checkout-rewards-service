@@ -8,7 +8,7 @@ function main(): void {
   // Throws, and so stops the process, if the configuration is invalid.
   const config = loadConfig();
   const pool = createPool(config.databaseUrl);
-  const app = createApp({ pool });
+  const app = createApp({ pool, config });
 
   const server = app.listen(config.port, () => {
     console.log(`Listening on http://localhost:${config.port}`);

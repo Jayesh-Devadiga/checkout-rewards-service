@@ -51,6 +51,7 @@ export const setCartItemBodySchema = z.strictObject({
 // Body of POST /carts/{cartId}/checkout. The body is optional.
 export const checkoutBodySchema = z.strictObject({
   accept_price_changes: z.boolean().optional(),
+  coupon_code: z.string().min(1).max(64).optional(),
 });
 
 // Body of PATCH /admin/products/{productId}. At least one field is needed.

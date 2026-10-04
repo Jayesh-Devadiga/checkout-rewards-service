@@ -2,12 +2,15 @@ import type { Pool, PoolClient } from 'pg';
 import { lockCart } from './carts';
 import { withTransaction } from './db/pool';
 import { AppError } from './errors';
+import { discountPaise } from './money';
 import { findOrderByCartId, getOrder, type OrderView } from './orders';
 
 export type CheckoutOptions = {
   // True when the client accepts prices that changed since the lines were
   // saved. False means: refuse the checkout and report the changes.
   acceptPriceChanges: boolean;
+  // The coupon to redeem, or null for no coupon.
+  couponCode: string | null;
 };
 
 export type CheckoutResult = {
@@ -31,12 +34,19 @@ type TakenLine = CartLine & {
   current_price_paise: number;
 };
 
+// A coupon this checkout has claimed.
+type ClaimedCoupon = {
+  id: number;
+  code: string;
+  discount_percent: number;
+};
+
 // Turns a cart into an order.
 //
 // Everything below runs in ONE database transaction. If any step throws, the
-// whole transaction is rolled back: stock goes back, no order exists and the
-// cart is still open. That is what makes "a failed checkout changes nothing"
-// true.
+// whole transaction is rolled back: stock goes back, the coupon is available
+// again, no order exists and the cart is still open. That is what makes
+// "a failed checkout changes nothing" true.
 export async function checkout(
   pool: Pool,
   cartId: string,
@@ -47,13 +57,25 @@ export async function checkout(
     //    it, waits here until this transaction ends.
     const status = await lockCart(client, cartId);
 
-    // 2. The cart already has an order. This is a retry: return that order
-    //    and change nothing. No second order, no stock taken twice.
+    // 2. The cart already has an order.
+    //    Same coupon as that order (or no coupon both times): this is a
+    //    retry. Return the order and change nothing. No second order, no
+    //    stock taken twice.
+    //    A different coupon: this is not a retry. It is a second checkout of
+    //    the same cart, which is not allowed. The coupon is not touched.
     if (status === 'checked_out') {
       const existing = await findOrderByCartId(client, cartId);
       if (existing === null) {
         // Cannot happen: the order and the status change commit together.
         throw new Error(`Cart ${cartId} is checked out but has no order.`);
+      }
+      if (existing.coupon_code !== options.couponCode) {
+        throw new AppError(
+          409,
+          'CART_ALREADY_CHECKED_OUT',
+          'This cart was already checked out, and not with this coupon. The existing order is unchanged.',
+          { cart_id: cartId, order_id: existing.id },
+        );
       }
       return { order: existing, created: false };
     }
@@ -74,23 +96,47 @@ export async function checkout(
       });
     }
 
-    // 4. Take the stock, all or nothing.
+    // 4. Claim the coupon, if one was sent. It is claimed before the stock
+    //    and price steps on purpose: if one of those fails, the rollback
+    //    hands the coupon back.
+    const coupon =
+      options.couponCode === null
+        ? null
+        : await claimCoupon(client, options.couponCode);
+
+    // 5. Take the stock, all or nothing.
     const taken = await takeStock(client, lines);
 
-    // 5. A price that changed since the line was saved must be accepted.
+    // 6. A price that changed since the line was saved must be accepted.
     refuseUnacceptedPriceChanges(taken, options);
 
-    // 6. Write the order. It copies the name and the price charged for
-    //    every line, so it never depends on the products table again.
+    // 7. Work out the money. One discount for the whole order, rounded down
+    //    to the paisa (see money.ts).
     const subtotal = taken.reduce(
       (sum, line) => sum + line.current_price_paise * line.quantity,
       0,
     );
+    const discountPercent = coupon === null ? 0 : coupon.discount_percent;
+    const discount = discountPaise(subtotal, discountPercent);
+    const total = subtotal - discount;
+
+    // 8. Write the order. It copies the name and the price charged for
+    //    every line, and the coupon code, so it never depends on the
+    //    products or coupons tables again.
     const { rows: inserted } = await client.query<{ id: string }>(
-      `INSERT INTO orders (cart_id, subtotal_paise, discount_percent, discount_paise, total_paise)
-       VALUES ($1, $2, 0, 0, $2)
+      `INSERT INTO orders
+         (cart_id, coupon_id, coupon_code, subtotal_paise, discount_percent, discount_paise, total_paise)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING id`,
-      [cartId, subtotal],
+      [
+        cartId,
+        coupon === null ? null : coupon.id,
+        coupon === null ? null : coupon.code,
+        subtotal,
+        discountPercent,
+        discount,
+        total,
+      ],
     );
     const orderId = inserted[0]!.id;
     for (const line of taken) {
@@ -109,7 +155,7 @@ export async function checkout(
       );
     }
 
-    // 7. Close the cart. From now on every change to it is refused, and
+    // 9. Close the cart. From now on every change to it is refused, and
     //    another checkout of it ends at step 2.
     await client.query("UPDATE carts SET status = 'checked_out' WHERE id = $1", [
       cartId,
@@ -117,6 +163,47 @@ export async function checkout(
 
     return { order: await getOrder(client, orderId), created: true };
   });
+}
+
+// Claims a coupon for this checkout, or throws if it cannot be used.
+//
+// The UPDATE below is the guard against a coupon being used twice. The check
+// (redeemed_at IS NULL) and the change (set redeemed_at) are one statement.
+// If two checkouts send the same code at the same moment, the database lets
+// one of them update the row. The other waits. When the first commits, the
+// second re-checks, finds the coupon already redeemed and matches no row.
+// If the first rolls back instead, the second gets the coupon.
+async function claimCoupon(
+  client: PoolClient,
+  code: string,
+): Promise<ClaimedCoupon> {
+  const { rows } = await client.query<ClaimedCoupon>(
+    `UPDATE coupons
+        SET redeemed_at = now()
+      WHERE code = $1
+        AND redeemed_at IS NULL
+      RETURNING id, code, discount_percent`,
+    [code],
+  );
+  if (rows.length === 1) {
+    return rows[0]!;
+  }
+
+  // Nothing was claimed. Tell the client which of the two reasons it was.
+  const existing = await client.query('SELECT 1 FROM coupons WHERE code = $1', [
+    code,
+  ]);
+  if (existing.rows.length === 0) {
+    throw new AppError(404, 'COUPON_NOT_FOUND', 'No coupon with this code.', {
+      coupon_code: code,
+    });
+  }
+  throw new AppError(
+    409,
+    'COUPON_ALREADY_REDEEMED',
+    'This coupon has already been used.',
+    { coupon_code: code },
+  );
 }
 
 // Takes the stock for every line, or throws INSUFFICIENT_STOCK listing every

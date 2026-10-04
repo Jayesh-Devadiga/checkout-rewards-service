@@ -31,7 +31,8 @@ export function buildOpenApiSpec(): object {
         { name: 'Orders' },
         {
           name: 'Admin',
-          description: 'Administrative operations. No authentication.',
+          description:
+            'Administrative operations: coupons and product changes. No authentication.',
         },
         { name: 'Service' },
       ],

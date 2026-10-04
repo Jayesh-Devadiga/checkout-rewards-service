@@ -1,5 +1,10 @@
 import { Router } from 'express';
 import type { Pool } from 'pg';
+import {
+  generateCoupon,
+  listCoupons,
+  type CouponSettings,
+} from '../coupons';
 import { AppError } from '../errors';
 import {
   parseOrThrow,
@@ -7,10 +12,103 @@ import {
   updateProductBodySchema,
 } from '../validation';
 
+/**
+ * @swagger
+ * components:
+ *   schemas:
+ *     Coupon:
+ *       type: object
+ *       properties:
+ *         code:
+ *           type: string
+ *           description: What the customer sends as coupon_code at checkout
+ *           example: K7M2Q9XDPA
+ *         discount_percent:
+ *           type: integer
+ *           example: 10
+ *         milestone_order_count:
+ *           type: integer
+ *           description: The order count that earned this coupon
+ *           example: 5
+ *         status:
+ *           type: string
+ *           enum: [available, redeemed]
+ *         redeemed_at:
+ *           type: string
+ *           format: date-time
+ *           nullable: true
+ *         redeemed_order_id:
+ *           type: string
+ *           format: uuid
+ *           nullable: true
+ *           description: The order that used this coupon
+ *         created_at:
+ *           type: string
+ *           format: date-time
+ */
+
 // Administrative operations. There is no authentication in this service, so
 // these routes are only marked as administrative by their /admin prefix.
-export function adminRouter(pool: Pool): Router {
+export function adminRouter(pool: Pool, couponSettings: CouponSettings): Router {
   const router = Router();
+
+  /**
+   * @swagger
+   * /admin/coupons:
+   *   post:
+   *     summary: Generate the next coupon that is owed (administrative)
+   *     description: >
+   *       Every nth placed order is a milestone, and each milestone earns one
+   *       coupon. Nothing is generated automatically. This call creates the
+   *       coupon for the lowest milestone that has been reached and has no
+   *       coupon yet. One coupon per call. If several are owed, call again.
+   *
+   *       n and the discount percent are set when the service starts
+   *       (COUPON_EVERY_N_ORDERS and COUPON_DISCOUNT_PERCENT).
+   *     tags: [Admin]
+   *     responses:
+   *       201:
+   *         description: The new coupon
+   *         content:
+   *           application/json:
+   *             schema:
+   *               $ref: '#/components/schemas/Coupon'
+   *       409:
+   *         description: >
+   *           NO_ELIGIBLE_MILESTONE. No coupon is owed right now. The details
+   *           give orders_placed and next_milestone_at.
+   *         content:
+   *           application/json:
+   *             schema:
+   *               $ref: '#/components/schemas/Error'
+   */
+  router.post('/admin/coupons', async (_req, res) => {
+    const coupon = await generateCoupon(pool, couponSettings);
+    res.status(201).json(coupon);
+  });
+
+  /**
+   * @swagger
+   * /admin/coupons:
+   *   get:
+   *     summary: List every coupon and whether it has been used (administrative)
+   *     tags: [Admin]
+   *     responses:
+   *       200:
+   *         description: All coupons, oldest milestone first
+   *         content:
+   *           application/json:
+   *             schema:
+   *               type: object
+   *               properties:
+   *                 coupons:
+   *                   type: array
+   *                   items:
+   *                     $ref: '#/components/schemas/Coupon'
+   */
+  router.get('/admin/coupons', async (_req, res) => {
+    res.json({ coupons: await listCoupons(pool) });
+  });
 
   /**
    * @swagger

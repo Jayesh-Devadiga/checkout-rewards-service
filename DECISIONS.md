@@ -21,11 +21,19 @@ The rules the service must never break, and where each one is enforced. The list
 7. **A retried checkout returns the same order and changes nothing.**
    A checkout that finds the cart already checked out returns the stored order with status 200. It takes no stock and writes nothing.
 8. **A failed checkout changes nothing.**
-   Checkout is one database transaction. Any failure rolls all of it back: stock taken for other lines is given back, no order exists, and the cart is still open.
+   Checkout is one database transaction. Any failure rolls all of it back: stock taken for other lines is given back, a coupon that was claimed is available again, no order exists, and the cart is still open.
 9. **An order never changes and explains itself.**
    An order stores its own copy of each product name, unit price, quantity and line total, plus subtotal, discount and total. Reading an order never touches the `products` table. The code has no statement that updates an order. Backstops in the database: `CHECK (total_paise = subtotal_paise - discount_paise)` and `CHECK (line_total_paise = unit_price_paise * quantity)`.
 10. **A changed price is not charged unless the client accepts it.**
     Checkout compares the price recorded on each cart line with the current price, and refuses with `PRICE_CHANGED` unless the request says `accept_price_changes: true`. There is one known gap, described under that decision.
+11. **A coupon is redeemed at most once.**
+    Checkout claims a coupon with one statement that checks and changes together: `UPDATE coupons SET redeemed_at = now() WHERE code = $1 AND redeemed_at IS NULL` (`claimCoupon` in `src/checkout.ts`). Backstop in the database: `UNIQUE (coupon_id)` on `orders`, so two orders cannot point at the same coupon.
+12. **A coupon is not used up by a checkout that fails.**
+    The coupon is claimed inside the checkout transaction, before the stock and price steps. If a later step fails, the rollback makes the coupon available again.
+13. **A milestone earns at most one coupon, and only after it is reached.**
+    Coupon generation takes a lock so that calls run one at a time, then compares the next milestone with the number of orders (`generateCoupon` in `src/coupons.ts`). Backstop in the database: `UNIQUE (milestone_order_count)` on `coupons`.
+14. **An order total is never negative, and a discount only exists with a coupon.**
+    A coupon's percent is between 1 and 100, checked at startup and by the database. The discount is rounded down, so it is never more than the subtotal. Backstops in the database: `CHECK (total_paise >= 0)` and a check that an order without a coupon has no discount.
 
 ## Decision: PostgreSQL, not an in-memory store
 
@@ -73,7 +81,7 @@ The rules the service must never break, and where each one is enforced. The list
 
 **Why:** A wrong value should fail loudly at startup, not quietly change behaviour. `x` above 100 would make a negative total possible, so it is refused. Changing the values at runtime raises questions I did not need to take on, such as a settings change racing with a checkout.
 
-**Consequences:** Changing `n` or `x` needs a restart. What a change in `n` means for coupons already earned is described in the coupon section, when that part is built.
+**Consequences:** Changing `n` or `x` needs a restart. What a change in `n` means for milestones is described under "Milestones, and what happens when n changes".
 
 ## Decision: One call sets the quantity of a cart line
 
@@ -126,14 +134,18 @@ There is no login, so the cart id is the only thing that protects a cart. Cart i
 Checkout is the one place where several things must change together, so it runs as one database transaction (`checkout` in `src/checkout.ts`). The steps:
 
 1. Lock the cart row.
-2. If the cart is already checked out, return its order and stop. This is the retry case.
+2. If the cart is already checked out, return its order and stop. This is the retry case. If the request names a different coupon than that order used, refuse with `CART_ALREADY_CHECKED_OUT`.
 3. Read the cart lines in product id order. No lines: `CART_EMPTY`.
-4. Take the stock for every line. If any line is short: `INSUFFICIENT_STOCK`, listing every short product.
-5. Compare each recorded price with the current price. A difference that was not accepted: `PRICE_CHANGED`.
-6. Write the order and its lines.
-7. Mark the cart as checked out.
+4. If a coupon code was sent, claim the coupon. Unknown code: `COUPON_NOT_FOUND`. Already used: `COUPON_ALREADY_REDEEMED`.
+5. Take the stock for every line. If any line is short: `INSUFFICIENT_STOCK`, listing every short product.
+6. Compare each recorded price with the current price. A difference that was not accepted: `PRICE_CHANGED`.
+7. Work out subtotal, discount and total.
+8. Write the order and its lines.
+9. Mark the cart as checked out.
 
-If any step fails, the transaction rolls back and nothing has changed. When several things are wrong at once, the client gets the first one in this order: empty cart, then stock, then price.
+If any step fails, the transaction rolls back and nothing has changed. When several things are wrong at once, the client gets the first one in this order: empty cart, then coupon, then stock, then price.
+
+The coupon is claimed at step 4, before the steps that are most likely to fail, on purpose. It means "a failed checkout does not use up the coupon" is really exercised: the coupon is claimed, a later step fails, and the rollback hands it back.
 
 **How overlapping requests are kept correct.** I use PostgreSQL's default isolation level (read committed). The safety does not come from a stricter level. It comes from two things:
 
@@ -150,8 +162,11 @@ What happens in each overlap:
 | A checkout is retried after it failed | It is simply evaluated again. The failed attempt left nothing behind. |
 | A cart line is changed while that cart is being checked out | Whichever takes the cart lock first goes first. Either the change is in the order, or the change is refused with `CART_ALREADY_CHECKED_OUT`. A line can never end up in a closed cart without being in its order. |
 | Two carts with the same two products check out together | Both lock the product rows in product id order, so they cannot deadlock. With that ordering removed as a test, real deadlocks occurred. |
+| Five carts check out with the same coupon at the same moment | Exactly one order gets the discount. The other four get `COUPON_ALREADY_REDEEMED`, their carts stay open and their stock is untouched. |
+| A checkout with a valid coupon fails on stock | The coupon is available again and works on the next checkout. |
+| Five admins ask for a coupon at the same moment, one milestone owed | Exactly one coupon. The other four get `NO_ELIGIBLE_MILESTONE`. |
 
-Each row of this table has a test in `test/checkout.test.ts`.
+Each row of this table has a test in `test/checkout.test.ts` or `test/coupons.test.ts`.
 
 ## Decision: The cart itself makes checkout safe to retry
 
@@ -161,7 +176,9 @@ Each row of this table has a test in `test/checkout.test.ts`.
 - An `Idempotency-Key` header. The client sends a random key with each attempt, and the server stores the key with the response and replays it. This is the general pattern payment APIs use. It needs a table of keys, a rule for the same key arriving with a different body, handling for a request that is still running, and expiry.
 - Use the cart. The assignment already says a cart must not be checked out more than once, so `POST /carts/{cartId}/checkout` names exactly one checkout.
 
-**Choice:** The cart. The first successful checkout returns 201. Any later checkout of that cart returns the same order with 200.
+**Choice:** The cart. The first successful checkout returns 201. A later checkout of that cart with the same coupon, or with no coupon both times, returns the same order with 200.
+
+A later call with a different coupon is not a retry. It is a second checkout of the same cart. It is refused with `CART_ALREADY_CHECKED_OUT`, the details carry the id of the existing order, and that second coupon is not touched. I chose this over always returning the existing order, because a client that sent a coupon should not get a success response for an order that did not use it.
 
 **Why:** The rule "one order per cart" has to exist anyway, and it already answers the retry question. A separate key would be a second mechanism guarding the same thing.
 
@@ -213,6 +230,70 @@ A client can also accept a new price before checkout by saving that cart line ag
 
 **Consequences:** A real payment changes the shape of checkout. The order would be created as pending, with the stock and any coupon held. The payment would then be attempted outside the transaction, each attempt recorded in its own table so it can be reconciled with the gateway. On success the order is confirmed. On failure or timeout the holds are released. That design also needs an expiry for orders that stay pending. None of that is built here.
 
+## Coupons: what the assignment leaves open, and what I chose
+
+The assignment says some coupon rules are not specified and asks for choices that can be defended. These are mine.
+
+- **Orders are counted across the whole store.** "Every nth successfully placed order" is one count for the store. I considered the other reading, where each customer's own nth order earns that customer a coupon. I did not take it because the assignment has no customers or accounts and says authentication is not needed. Without authentication, "this coupon belongs to customer 7" cannot be enforced, because anyone can claim to be customer 7. If the rule changed to per customer, the design would need a customers table, a customer id on carts, orders and coupons, and the milestone counted per customer.
+- **Nothing is generated automatically.** Reaching a milestone makes a coupon owed. The administrator's call creates it. This follows the assignment's wording: "generate a coupon when an unrewarded milestone is eligible". An unrewarded milestone can only exist if reaching one does not create the coupon by itself.
+- **One coupon per call, lowest milestone first.** With 12 orders and n = 5, the first call gives the coupon for order 5, the second for order 10, and the third is refused with `NO_ELIGIBLE_MILESTONE` and says the next one is earned at order 15.
+- **Whoever holds the code can use it, once.** With no customers, the code itself is the right to the discount. Codes are 10 random characters from an alphabet of 32, about 10^15 possibilities, generated with Node's crypto module.
+- **One coupon per order, taken off the whole subtotal.**
+- **Every placed order counts toward milestones,** including orders that used a coupon. The milestone count is then simply the number of orders, which the report also shows.
+- **Coupons do not expire.** An `expires_at` column is the obvious addition.
+- **A coupon that cannot be used fails the checkout.** An unknown code gives `COUPON_NOT_FOUND`, a used one gives `COUPON_ALREADY_REDEEMED`. I did not place the order at full price instead, because the customer expected a discount and would be charged more than they agreed to.
+- **The percent lives on the coupon.** It is copied from the setting when the coupon is generated. Changing `x` later does not change coupons that already exist.
+
+**A known weakness.** Because there are no customers, nothing stops one person from collecting every coupon and using them all, one per order. Fixing it needs customer identity and a limit per customer.
+
+## Decision: Redeeming a coupon is one statement
+
+**Context:** A coupon must be used at most once, also when two checkouts send the same code at the same moment.
+
+**Options considered:**
+- Read the coupon, check in application code that it is unused, then mark it used. This is the natural way to write it, and it is wrong under concurrency: two requests can both read "unused" before either writes.
+- Lock the coupon row first with `SELECT ... FOR UPDATE`, then check and update. Correct, with two statements.
+- One `UPDATE` that only matches an unused coupon, and a check of how many rows it changed.
+
+**Choice:** The single `UPDATE`: `SET redeemed_at = now() WHERE code = $1 AND redeemed_at IS NULL`. One row changed means this checkout owns the coupon. No row changed means it was unknown or already used, and a second query tells the client which.
+
+**Why:** I have seen the first option fail. In an earlier project I built a coupon validator that read the usage rows, counted them in application code and answered "this coupon can be used". The usage was written later, by a different request. Two redemptions at the same moment could both read "under the limit" and both go through. Here the database does the check and the change together, so there is no gap between them.
+
+**Consequences:** It is the same pattern as the stock update, so the two most important guards in the service work the same way.
+
+## Decision: Milestones, and what happens when n changes
+
+**Context:** `n` is a setting, so it can be different after a restart. I had to decide what a milestone is in a way that still makes sense then.
+
+**Options considered:**
+- Milestones are multiples of `n` counted from the first order, and the number of coupons owed is recalculated from that. Changing `n` from 5 to 3 after 12 orders would then suddenly owe coupons for orders 3, 6, 9 and 12, long after the fact.
+- The next milestone is the last rewarded milestone plus `n`. A change never looks backwards, but the milestones stop being multiples of `n` (13, 16, 19), which is harder to explain to anyone.
+- Milestones are always multiples of the current `n`, and the next one is the next multiple above the last milestone that already has a coupon.
+
+**Choice:** The third. Each coupon records the order count that earned it. Example with coupons already given for orders 5 and 10:
+
+- `n` stays 5: the next milestone is 15.
+- `n` changes to 3: the next is 12, then 15, then 18.
+- `n` changes to 10: the next is 20.
+
+**Why:** It is easy to say: every nth order, counted in multiples of `n`, and never twice for the same ground. A change of `n` only affects milestones that have no coupon yet.
+
+**Consequences:** If milestones were owed but not yet generated when `n` changes, they are measured with the new `n`. A milestone only becomes fixed once its coupon exists. A full history (n was 5 for the first 30 orders, then 3) would need a settings history table. That is not built.
+
+## Decision: Coupon generation uses a lock and a unique constraint
+
+**Context:** Two administrators can ask for a coupon at the same moment. One milestone must not get two coupons.
+
+**Options considered:**
+- Only the unique constraint on the milestone. It prevents a duplicate. With the lock removed as a test, six simultaneous calls with two milestones owed never created a duplicate, but the losing calls failed with a 500, and in most runs only one of the two owed coupons was created.
+- A lock so that generation calls run one at a time, with the unique constraint behind it.
+
+**Choice:** Both. Generation first takes a PostgreSQL advisory lock, which is a lock on a number, not on a row. I used it because there is no row to lock: the thing being protected is the next milestone, which does not exist yet. The lock is released when the transaction ends.
+
+**Why:** With the lock the outcome is exact. One milestone owed and five callers: one coupon and four clear refusals. Two owed and four callers: two coupons, one per milestone, and two refusals.
+
+**Consequences:** Advisory locks are a PostgreSQL feature. Generation counts orders with `COUNT(*)`, which is fine at this size. A counter row would replace it at scale.
+
 ## Admin: changing a product's price or stock
 
 `PATCH /admin/products/{productId}` sets the price, the stock, or both. I added it so the price-change and stock-change behaviour can be exercised through the API, not only with SQL.
@@ -226,7 +307,12 @@ A client can also accept a new price before checkout by saving that cart line ag
 - Every amount is a whole number of paise (100 paise = 1 rupee). That holds in the database (`price_paise integer`), in the code and in the API. `64900` means Rs 649.00.
 - There are no floating-point numbers and no decimals anywhere in the money path.
 - Price times quantity, and adding lines up, is whole-number arithmetic. It never needs rounding.
-- The one place a fraction can appear is a percentage discount. That rule is written in the coupon section, when that part is built.
+- The one place a fraction can appear is a percentage discount. The rule: **discount = subtotal × percent ÷ 100, rounded down to the paisa.** It is worked out once, on the order subtotal. Total = subtotal − discount.
+  - Example: 10% of Rs 499.99 is 4999.9 paise. There is no 0.9 of a paisa, so the discount is 4999 paise and the total is Rs 450.00.
+  - Rounding down means a discount is never more than the percent says. It can be short by less than one paisa.
+  - One discount per order, not one per item. Three bottles at Rs 499.99 give 14999 paise off the order. Rounding the discount on each bottle separately would give 3 × 4999 = 14997, and the pieces would no longer add up to the percentage of the order.
+  - The percent is at most 100, so the discount is never more than the subtotal and a total cannot go below zero.
+  - The code does not use floating point for this. `discountPaise` in `src/money.ts` multiplies two whole numbers, takes off the remainder, and then divides, so the division is exact.
 - Limit: an integer column holds up to about Rs 2.1 crore per amount. Past that the database rejects the write. It does not wrap around.
 
 ## Error model
@@ -253,7 +339,10 @@ Codes so far:
 | 404 | `CART_NOT_FOUND` | No cart with that id |
 | 404 | `PRODUCT_NOT_FOUND` | No product with that id |
 | 404 | `ORDER_NOT_FOUND` | No order with that id |
-| 409 | `CART_ALREADY_CHECKED_OUT` | A change was sent to a cart that has been checked out |
+| 404 | `COUPON_NOT_FOUND` | Checkout with a coupon code that does not exist |
+| 409 | `CART_ALREADY_CHECKED_OUT` | A change was sent to a cart that has been checked out, or a checkout names a different coupon than the cart's order used. In the second case `details.order_id` is the existing order. |
+| 409 | `COUPON_ALREADY_REDEEMED` | Checkout with a coupon that was used before |
+| 409 | `NO_ELIGIBLE_MILESTONE` | Coupon generation when no coupon is owed. The details give `orders_placed` and `next_milestone_at`. |
 | 409 | `CART_EMPTY` | Checkout of a cart with no items |
 | 409 | `INSUFFICIENT_STOCK` | A quantity is more than is in stock. `details.items` lists each product with `requested` and `available`. |
 | 409 | `PRICE_CHANGED` | A price changed since the line was saved and was not accepted. `details.items` lists each product with both prices. |
@@ -271,7 +360,6 @@ Each later part adds its own.
 
 These sections are added as the parts are built:
 
-- Coupons and milestones, including the discount rounding rule
 - The report
 - Ambiguities I found and the meaning I chose
 - What is implemented and what is deferred
