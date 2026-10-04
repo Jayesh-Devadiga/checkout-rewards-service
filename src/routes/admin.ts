@@ -6,6 +6,7 @@ import {
   type CouponSettings,
 } from '../coupons';
 import { AppError } from '../errors';
+import { buildReport } from '../report';
 import {
   parseOrThrow,
   productIdSchema,
@@ -45,6 +46,74 @@ import {
  *         created_at:
  *           type: string
  *           format: date-time
+ *     Report:
+ *       type: object
+ *       properties:
+ *         total_orders:
+ *           type: integer
+ *           description: Successfully placed orders
+ *           example: 6
+ *         items_purchased:
+ *           type: array
+ *           description: Units sold per product
+ *           items:
+ *             type: object
+ *             properties:
+ *               product_id:
+ *                 type: integer
+ *                 example: 2
+ *               name:
+ *                 type: string
+ *                 example: Toor Dal 1 kg
+ *               quantity:
+ *                 type: integer
+ *                 example: 6
+ *         gross_revenue_paise:
+ *           type: integer
+ *           description: Sum of order subtotals, before discounts
+ *           example: 113700
+ *         total_discount_paise:
+ *           type: integer
+ *           description: Sum of order discounts
+ *           example: 1895
+ *         net_revenue_paise:
+ *           type: integer
+ *           description: Sum of order totals. Always gross minus discounts.
+ *           example: 111805
+ *         coupons:
+ *           type: object
+ *           properties:
+ *             generated:
+ *               type: integer
+ *               description: Coupons that exist
+ *               example: 1
+ *             available:
+ *               type: integer
+ *               description: Generated and not yet used
+ *               example: 0
+ *             redeemed:
+ *               type: integer
+ *               description: Used on an order. generated = available + redeemed.
+ *               example: 1
+ *         milestones:
+ *           type: object
+ *           properties:
+ *             every_n_orders:
+ *               type: integer
+ *               description: n, the current setting
+ *               example: 5
+ *             last_rewarded_at_order:
+ *               type: integer
+ *               description: Order count of the last milestone that has a coupon. 0 if none.
+ *               example: 5
+ *             next_at_order:
+ *               type: integer
+ *               description: Order count at which the next coupon is earned
+ *               example: 10
+ *             coupons_owed:
+ *               type: integer
+ *               description: Milestones reached that have no coupon yet
+ *               example: 0
  */
 
 // Administrative operations. There is no authentication in this service, so
@@ -108,6 +177,30 @@ export function adminRouter(pool: Pool, couponSettings: CouponSettings): Router 
    */
   router.get('/admin/coupons', async (_req, res) => {
     res.json({ coupons: await listCoupons(pool) });
+  });
+
+  /**
+   * @swagger
+   * /admin/report:
+   *   get:
+   *     summary: Summary of orders, revenue and coupons (administrative)
+   *     description: >
+   *       Counts only successfully placed orders. All figures are taken from
+   *       one read-only snapshot of the database, so they agree with each
+   *       other even while checkouts are running: net revenue is gross minus
+   *       discounts, and coupons generated is available plus redeemed.
+   *       Calling it changes nothing.
+   *     tags: [Admin]
+   *     responses:
+   *       200:
+   *         description: The report
+   *         content:
+   *           application/json:
+   *             schema:
+   *               $ref: '#/components/schemas/Report'
+   */
+  router.get('/admin/report', async (_req, res) => {
+    res.json(await buildReport(pool, couponSettings));
   });
 
   /**

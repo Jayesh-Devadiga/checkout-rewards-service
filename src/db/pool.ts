@@ -29,3 +29,28 @@ export async function withTransaction<T>(
     client.release();
   }
 }
+
+// Runs fn inside a transaction that can only read, and that sees one frozen
+// picture of the database from start to finish.
+//
+// REPEATABLE READ: every query in the transaction sees the data as it was
+// when the first query ran, even if other requests commit in between. A
+// report built from several queries therefore adds up.
+// READ ONLY: the database refuses any write inside this transaction.
+export async function withReadOnlySnapshot<T>(
+  pool: Pool,
+  fn: (client: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}

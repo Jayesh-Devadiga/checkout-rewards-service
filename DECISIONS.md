@@ -34,6 +34,8 @@ The rules the service must never break, and where each one is enforced. The list
     Coupon generation takes a lock so that calls run one at a time, then compares the next milestone with the number of orders (`generateCoupon` in `src/coupons.ts`). Backstop in the database: `UNIQUE (milestone_order_count)` on `coupons`.
 14. **An order total is never negative, and a discount only exists with a coupon.**
     A coupon's percent is between 1 and 100, checked at startup and by the database. The discount is rounded down, so it is never more than the subtotal. Backstops in the database: `CHECK (total_paise >= 0)` and a check that an order without a coupon has no discount.
+15. **The report only reads, and its figures agree with each other.**
+    The report runs in a read-only transaction that sees one frozen picture of the database (`withReadOnlySnapshot` in `src/db/pool.ts`). The database refuses any write inside it. Net revenue is always gross minus discounts, and coupons generated is always available plus redeemed.
 
 ## Decision: PostgreSQL, not an in-memory store
 
@@ -257,7 +259,7 @@ The assignment says some coupon rules are not specified and asks for choices tha
 
 **Choice:** The single `UPDATE`: `SET redeemed_at = now() WHERE code = $1 AND redeemed_at IS NULL`. One row changed means this checkout owns the coupon. No row changed means it was unknown or already used, and a second query tells the client which.
 
-**Why:** I have seen the first option fail. In an earlier project I built a coupon validator that read the usage rows, counted them in application code and answered "this coupon can be used". The usage was written later, by a different request. Two redemptions at the same moment could both read "under the limit" and both go through. Here the database does the check and the change together, so there is no gap between them.
+**Why:** The first option has a gap between the check and the write. Two checkouts at the same moment can both read "unused" and both go on to redeem the coupon. Here the database does the check and the change together, so there is no gap. The second option is also correct, but it takes two statements where one is enough.
 
 **Consequences:** It is the same pattern as the stock update, so the two most important guards in the service work the same way.
 
@@ -293,6 +295,32 @@ The assignment says some coupon rules are not specified and asks for choices tha
 **Why:** With the lock the outcome is exact. One milestone owed and five callers: one coupon and four clear refusals. Two owed and four callers: two coupons, one per milestone, and two refusals.
 
 **Consequences:** Advisory locks are a PostgreSQL feature. Generation counts orders with `COUNT(*)`, which is fine at this size. A counter row would replace it at scale.
+
+## The report
+
+`GET /admin/report` returns the summary the assignment asks for.
+
+- **Only placed orders count.** A checkout that fails leaves no order behind, and a cart that was never checked out is not an order. So every row in `orders` is a successfully placed order, and the report just counts and sums them.
+- **The money figures are sums of what each order stored.** Gross revenue is the sum of order subtotals, total discounts is the sum of order discounts, and net revenue is the sum of order totals. Every order satisfies total = subtotal − discount (the database checks it), so the three sums satisfy net = gross − discounts.
+- **Quantity by product comes from order lines.** The name shown next to it is the product's current name.
+- **Coupons: generated, available, redeemed.** I read "available" as generated and not yet used, so generated = available + redeemed. The word could also mean "earned but not yet generated". To cover that reading too, the report has a `milestones` block with `coupons_owed` (milestones reached that have no coupon yet), the last rewarded milestone and the next one.
+
+**It reconciles.** A test places a mixed set of orders, some with a coupon, then adds up the orders returned by `GET /orders/{id}` and the coupons returned by `GET /admin/coupons`, and compares the result with the report.
+
+## Decision: The report reads from one snapshot
+
+**Context:** The report is built from three queries: orders, order lines and coupons. Checkouts can commit while it runs. The assignment says the report should reconcile and that repeated requests must not change state.
+
+**Options considered:**
+- Run the three queries one after another with no transaction. Each query then sees a different moment. An order can be counted in the number of orders and be missing from the quantities. With the snapshot removed as a test, a test that takes reports while 24 checkouts run failed on every run.
+- Put everything into one large SQL statement. One statement sees one moment, but it is hard to read and to change.
+- Run the queries in one transaction at the repeatable-read level, marked read only.
+
+**Choice:** The third. Repeatable read means every query in the transaction sees the data as it was when the first one ran. Read only means the database itself refuses a write.
+
+**Why:** The queries stay small and readable, the figures always agree with each other, and "the report does not change state" is enforced by the database, not only by my being careful.
+
+**Consequences:** The report is worked out from all orders on every call. That is fine at this size. With many orders I would keep running totals, or run the report against a read replica. Sums are converted to JavaScript numbers and refused above about 9 × 10^15 paise, far beyond anything this store will reach.
 
 ## Admin: changing a product's price or stock
 
@@ -360,7 +388,6 @@ Each later part adds its own.
 
 These sections are added as the parts are built:
 
-- The report
 - Ambiguities I found and the meaning I chose
 - What is implemented and what is deferred
 - Multiple instances and production scale

@@ -2,7 +2,7 @@
 
 Backend for a small store: carts, checkout, orders, inventory and discount coupons.
 
-**Status: in progress.** The work lands in small slices and this README grows with it. So far: project setup, database migrations, seed data, the product list, carts, checkout, orders, coupons and the API docs page. The report is still to come.
+**Status: in progress.** The work lands in small slices and this README grows with it. All the features are built: products, carts, checkout, orders, coupons, the report and the API docs page. Still to come: running the whole thing with one Docker command, and a fuller README.
 
 The design choices and the reasons for them are in [DECISIONS.md](DECISIONS.md).
 
@@ -70,6 +70,7 @@ The service, `npm run migrate`, `npm run seed` and `npm test` all read `.env` if
 | `GET /orders/{orderId}` | Shows an order with its lines and totals |
 | `POST /admin/coupons` | Administrative. Generates the next coupon that is owed. A coupon is owed at every nth placed order. |
 | `GET /admin/coupons` | Administrative. Lists every coupon and whether it has been used |
+| `GET /admin/report` | Administrative. Orders, quantities by product, gross and net revenue, discounts and coupon counts |
 | `PATCH /admin/products/{productId}` | Administrative. Changes a product's price or stock. Body: `{ "price_paise": 69900 }`, `{ "stock": 50 }` or both |
 | `GET /docs` | Swagger UI, with every request, response and error |
 | `GET /docs.json` | The OpenAPI document |

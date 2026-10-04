@@ -38,6 +38,22 @@ export function nextMilestone(lastRewarded: number, n: number): number {
   return (Math.floor(lastRewarded / n) + 1) * n;
 }
 
+// How many coupons are owed right now: milestones that have been reached and
+// have no coupon yet. Each one takes one call to generate.
+export function couponsOwed(
+  lastRewarded: number,
+  n: number,
+  ordersPlaced: number,
+): number {
+  const next = nextMilestone(lastRewarded, n);
+  if (next > ordersPlaced) {
+    return 0;
+  }
+  // The next milestone is reached, and so is every further multiple of n up
+  // to the number of orders.
+  return Math.floor((ordersPlaced - next) / n) + 1;
+}
+
 // Letters and digits that are hard to confuse: no 0 or O, no 1 or I.
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const CODE_LENGTH = 10;

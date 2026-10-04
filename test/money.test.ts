@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { nextMilestone } from '../src/coupons';
+import { couponsOwed, nextMilestone } from '../src/coupons';
 import { discountPaise } from '../src/money';
 
 describe('discountPaise', () => {
@@ -64,5 +64,21 @@ describe('nextMilestone', () => {
     [7, 1, 8],
   ])('after %i with n = %i comes %i', (lastRewarded, n, expected) => {
     expect(nextMilestone(lastRewarded, n)).toBe(expected);
+  });
+});
+
+describe('couponsOwed', () => {
+  // [last rewarded, n, orders placed, expected coupons owed]
+  it.each([
+    [0, 5, 4, 0], // first milestone not reached
+    [0, 5, 5, 1],
+    [0, 5, 12, 2], // milestones 5 and 10
+    [5, 5, 12, 1], // milestone 10
+    [10, 5, 12, 0], // next is 15
+    [10, 3, 12, 1], // n changed to 3: milestone 12
+    [10, 3, 18, 3], // 12, 15 and 18
+    [10, 10, 19, 0], // n changed to 10: next is 20
+  ])('last %i, n = %i, %i orders: %i owed', (last, n, orders, expected) => {
+    expect(couponsOwed(last, n, orders)).toBe(expected);
   });
 });
